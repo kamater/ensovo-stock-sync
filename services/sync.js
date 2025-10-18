@@ -1,9 +1,3 @@
-/* -----------------------------------------------------
-   🧩 Ensovo Stock Sync Service
-   Bidirectional real-time stock sync between 2 stores
------------------------------------------------------ */
-const chalk = require('chalk');
-
 class SyncService {
   constructor(shopifyStore1, shopifyStore2, redisClient) {
     this.store1 = shopifyStore1;
@@ -13,42 +7,19 @@ class SyncService {
     this.syncTag = process.env.SYNC_TAG || 'sync-stock';
     this.debounceDelay = parseInt(process.env.DEBOUNCE_DELAY) || 2000;
     this.pendingSyncs = new Map();
+    
+    // Cache duration: 1 hour
+    this.cacheDuration = 3600;
   }
 
-  /* -----------------------------------------------------
-     📥 HANDLE INVENTORY UPDATE
-  ----------------------------------------------------- */
   async handleInventoryUpdate(sourceStore, webhookData) {
     try {
+      console.log(`\n📥 Inventory update from ${sourceStore}:`, JSON.stringify(webhookData, null, 2));
+
       const { inventory_item_id, location_id, available } = webhookData;
-      const sourceService = sourceStore === 'store1' ? this.store1 : this.store2;
-
-      // On récupère le produit correspondant
-      const productData = await this.findProductByInventoryItem(sourceService, inventory_item_id);
-      let sku = 'unknown';
-      let productTitle = 'unknown';
-      let ean = 'unknown';
-
-      if (productData) {
-        sku = productData.variant.sku || 'no-sku';
-        productTitle = productData.product.title || 'no-title';
-        ean = productData.variant.barcode || 'no-ean';
-      }
-
-      // Détermination de la couleur du log selon la variation du stock
-      let colorFn = chalk.gray;
-      if (available > 0) colorFn = chalk.green;
-      if (available === 0) colorFn = chalk.red;
-
-      console.log(colorFn(`\n📥 Inventory update from ${sourceStore.toUpperCase()}:`));
-      console.log(colorFn(`   🏷️  Product: ${productTitle}`));
-      console.log(colorFn(`   🔢 SKU: ${sku}`));
-      console.log(colorFn(`   📦 Available: ${available}`));
-      console.log(colorFn(`   🆔 Inventory item ID: ${inventory_item_id}`));
-      console.log(colorFn(`   📍 Location ID: ${location_id}`));
-      console.log(colorFn(`   🧾 EAN: ${ean}`));
 
       // Check if this is the Ensovo location
+      const sourceService = sourceStore === 'store1' ? this.store1 : this.store2;
       const ensovoLocation = await sourceService.getLocationByName(this.ensovoLocationName);
 
       if (location_id !== ensovoLocation.id) {
@@ -59,32 +30,35 @@ class SyncService {
       // Check if this is a sync we triggered (avoid infinite loop)
       const lockKey = `sync:lock:${sourceStore}:${inventory_item_id}`;
       const isLocked = await this.redis.get(lockKey);
+      
       if (isLocked) {
         console.log(`🔒 Skipping - sync lock active`);
         return;
       }
 
+      // Find the product by inventory_item_id using CACHE
+      const productData = await this.findProductByInventoryItemCached(sourceService, sourceStore, inventory_item_id);
+      
       if (!productData) {
-        console.log(`⏭️  Product not found for inventory item ${inventory_item_id}`);
+        console.log(`⏭️  Product not found or doesn't have ${this.syncTag} tag`);
         return;
       }
 
       const { product, variant } = productData;
-
-      if (!product.tags.split(',').map(t => t.trim()).includes(this.syncTag)) {
-        console.log(`⏭️  Product doesn't have ${this.syncTag} tag`);
-        return;
-      }
 
       if (!variant.barcode) {
         console.log(`⏭️  Variant has no EAN/barcode`);
         return;
       }
 
+      const ean = variant.barcode;
+
+      // Get previous value from cache
       const cacheKey = `inventory:${sourceStore}:${ean}`;
       const previousValue = await this.redis.get(cacheKey);
       const previousAvailable = previousValue ? parseInt(previousValue) : null;
 
+      // Calculate delta
       let delta = 0;
       if (previousAvailable !== null) {
         delta = available - previousAvailable;
@@ -93,8 +67,10 @@ class SyncService {
         console.log(`ℹ️  No previous value in cache, will do full sync`);
       }
 
+      // Store new value in cache
       await this.redis.setEx(cacheKey, 3600 * 24, available.toString());
 
+      // Debounce and sync
       const debounceKey = `sync:debounce:${sourceStore}:${ean}`;
       await this.debounce(debounceKey, async () => {
         if (previousAvailable !== null && delta !== 0) {
@@ -112,117 +88,146 @@ class SyncService {
     }
   }
 
-  /* -----------------------------------------------------
-     🔍 FIND PRODUCT BY INVENTORY ITEM
-  ----------------------------------------------------- */
-  async findProductByInventoryItem(shopifyService, inventoryItemId) {
-    const products = await shopifyService.getProductsByTag(this.syncTag);
-
+  async findProductByInventoryItemCached(shopifyService, storeName, inventoryItemId) {
+    // Try to get from cache first
+    const cacheKey = `products:${storeName}:${this.syncTag}`;
+    let cachedProducts = await this.redis.get(cacheKey);
+    
+    if (!cachedProducts) {
+      console.log(`🔄 Cache miss - loading products with tag "${this.syncTag}" from ${storeName}...`);
+      
+      // Load products with sync tag
+      const products = await shopifyService.getProductsByTag(this.syncTag);
+      
+      // Store in cache for 1 hour
+      await this.redis.setEx(cacheKey, this.cacheDuration, JSON.stringify(products));
+      cachedProducts = JSON.stringify(products);
+      
+      console.log(`✅ Cached ${products.length} products for ${storeName}`);
+    } else {
+      console.log(`✅ Cache hit - using cached products for ${storeName}`);
+    }
+    
+    const products = JSON.parse(cachedProducts);
+    
+    // Find product with matching inventory_item_id
     for (const product of products) {
       for (const variant of product.variants) {
         if (variant.inventory_item_id === inventoryItemId) {
+          console.log(`✅ Found product: ${product.title} (inventory_item_id: ${inventoryItemId})`);
           return { product, variant };
         }
       }
     }
-
+    
     return null;
   }
 
-  /* -----------------------------------------------------
-     🔁 SYNC DELTA TO OTHER STORE
-  ----------------------------------------------------- */
   async syncDeltaToOtherStore(sourceStore, ean, delta, newValue) {
     try {
       const targetStore = sourceStore === 'store1' ? 'store2' : 'store1';
       const targetService = targetStore === 'store1' ? this.store1 : this.store2;
 
-      const colorFn = delta > 0 ? chalk.green : chalk.red;
-      console.log(colorFn(`\n🔄 Syncing delta for EAN ${ean} from ${sourceStore} → ${targetStore}: ${delta > 0 ? '+' : ''}${delta} (new value: ${newValue})`));
+      console.log(`🔄 Syncing delta for EAN ${ean} from ${sourceStore} to ${targetStore}: ${delta > 0 ? '+' : ''}${delta} (new value: ${newValue})`);
 
+      // Find product in target store by EAN
       const targetProductData = await targetService.getProductByEan(ean);
+      
       if (!targetProductData) {
         console.log(`⚠️  Product with EAN ${ean} not found in ${targetStore}`);
         return;
       }
 
       const { variant: targetVariant } = targetProductData;
+
+      // Get Ensovo location in target store
       const targetEnsovoLocation = await targetService.getLocationByName(this.ensovoLocationName);
 
+      // Set sync lock to prevent infinite loop
       const lockKey = `sync:lock:${targetStore}:${targetVariant.inventory_item_id}`;
-      await this.redis.setEx(lockKey, 30, '1');
+      await this.redis.setEx(lockKey, 30, '1'); // Lock for 30 seconds
 
+      // Apply delta to target store
       await targetService.adjustInventoryLevel(
         targetVariant.inventory_item_id,
         targetEnsovoLocation.id,
         delta
       );
 
+      // Update cache for target store
       const targetCacheKey = `inventory:${targetStore}:${ean}`;
       const targetCurrentValue = await this.redis.get(targetCacheKey);
       if (targetCurrentValue) {
         const targetNewValue = parseInt(targetCurrentValue) + delta;
         await this.redis.setEx(targetCacheKey, 3600 * 24, targetNewValue.toString());
-        console.log(colorFn(`✅ Applied delta ${delta > 0 ? '+' : ''}${delta} to ${targetStore} (${targetCurrentValue} → ${targetNewValue})`));
+        console.log(`✅ Successfully applied delta ${delta > 0 ? '+' : ''}${delta} to ${targetStore} (${targetCurrentValue} → ${targetNewValue})`);
       } else {
         await this.redis.setEx(targetCacheKey, 3600 * 24, newValue.toString());
-        console.log(colorFn(`✅ Set ${targetStore} to ${newValue} units (no previous cache)`));
+        console.log(`✅ Successfully applied delta ${delta > 0 ? '+' : ''}${delta} to ${targetStore} (set to ${newValue})`);
       }
 
+      // Log sync event
       await this.logSyncEvent(sourceStore, targetStore, ean, delta, 'delta');
+
     } catch (error) {
       console.error(`❌ Error syncing delta to other store:`, error);
       throw error;
     }
   }
 
-  /* -----------------------------------------------------
-     📦 FULL SYNC TO OTHER STORE
-  ----------------------------------------------------- */
   async syncFullToOtherStore(sourceStore, ean, available) {
     try {
       const targetStore = sourceStore === 'store1' ? 'store2' : 'store1';
       const targetService = targetStore === 'store1' ? this.store1 : this.store2;
 
-      console.log(chalk.blue(`\n🔄 Full sync for EAN ${ean} from ${sourceStore} → ${targetStore}: ${available} units`));
+      console.log(`🔄 Full sync for EAN ${ean} from ${sourceStore} to ${targetStore}: ${available} units`);
 
+      // Find product in target store by EAN
       const targetProductData = await targetService.getProductByEan(ean);
+      
       if (!targetProductData) {
         console.log(`⚠️  Product with EAN ${ean} not found in ${targetStore}`);
         return;
       }
 
       const { variant: targetVariant } = targetProductData;
+
+      // Get Ensovo location in target store
       const targetEnsovoLocation = await targetService.getLocationByName(this.ensovoLocationName);
 
+      // Set sync lock to prevent infinite loop
       const lockKey = `sync:lock:${targetStore}:${targetVariant.inventory_item_id}`;
       await this.redis.setEx(lockKey, 30, '1');
 
+      // Set absolute value in target store
       await targetService.setInventoryLevel(
         targetVariant.inventory_item_id,
         targetEnsovoLocation.id,
         available
       );
 
+      // Update cache for target store
       const targetCacheKey = `inventory:${targetStore}:${ean}`;
       await this.redis.setEx(targetCacheKey, 3600 * 24, available.toString());
 
-      console.log(chalk.blue(`✅ Set ${targetStore} to ${available} units`));
+      console.log(`✅ Successfully set ${targetStore} to ${available} units`);
+
+      // Log sync event
       await this.logSyncEvent(sourceStore, targetStore, ean, available, 'full');
+
     } catch (error) {
       console.error(`❌ Error full syncing to other store:`, error);
       throw error;
     }
   }
 
-  /* -----------------------------------------------------
-     ⏱️ DEBOUNCE
-  ----------------------------------------------------- */
   async debounce(key, callback) {
+    // Clear existing timeout if any
     if (this.pendingSyncs.has(key)) {
       clearTimeout(this.pendingSyncs.get(key));
     }
 
+    // Set new timeout
     const timeoutId = setTimeout(async () => {
       this.pendingSyncs.delete(key);
       await callback();
@@ -231,9 +236,6 @@ class SyncService {
     this.pendingSyncs.set(key, timeoutId);
   }
 
-  /* -----------------------------------------------------
-     🧾 LOGGING HELPERS
-  ----------------------------------------------------- */
   async logSyncEvent(sourceStore, targetStore, ean, value, type) {
     const timestamp = Date.now();
     const key = `sync:log:${timestamp}:${Math.random().toString(36).substr(2, 9)}`;
@@ -245,8 +247,10 @@ class SyncService {
       type,
       timestamp: new Date().toISOString()
     };
+    
+    await this.redis.setEx(key, 86400 * 7, JSON.stringify(logData)); // Keep for 7 days
 
-    await this.redis.setEx(key, 86400 * 7, JSON.stringify(logData));
+    // Increment counter
     await this.redis.incr('sync:count:total');
   }
 
@@ -260,13 +264,14 @@ class SyncService {
       webhookData,
       timestamp: new Date().toISOString()
     }));
+
     await this.redis.incr('error:count:total');
   }
 
   async getStats() {
     const totalSyncs = await this.redis.get('sync:count:total') || 0;
     const totalErrors = await this.redis.get('error:count:total') || 0;
-
+    
     return {
       totalSyncs: parseInt(totalSyncs),
       totalErrors: parseInt(totalErrors),
@@ -277,25 +282,39 @@ class SyncService {
   async getLogs(limit = 50) {
     const keys = await this.redis.keys('sync:log:*');
     const sortedKeys = keys.sort().reverse().slice(0, limit);
+    
     const logs = [];
-
     for (const key of sortedKeys) {
       const data = await this.redis.get(key);
-      if (data) logs.push(JSON.parse(data));
+      if (data) {
+        logs.push(JSON.parse(data));
+      }
     }
-
+    
     return logs;
   }
 
   async clearCache(ean, storeName) {
-    const cacheKey = `inventory:${storeName}:${ean}`;
-    await this.redis.del(cacheKey);
+    // Clear inventory cache
+    const inventoryCacheKey = `inventory:${storeName}:${ean}`;
+    await this.redis.del(inventoryCacheKey);
+    
+    // Clear products cache (will force reload)
+    const productsCacheKey = `products:${storeName}:${this.syncTag}`;
+    await this.redis.del(productsCacheKey);
+    
     console.log(`🗑️  Cache cleared for ${ean} in ${storeName}`);
+  }
+
+  async refreshCache(storeName) {
+    const productsCacheKey = `products:${storeName}:${this.syncTag}`;
+    await this.redis.del(productsCacheKey);
+    console.log(`🔄 Products cache cleared for ${storeName} - will reload on next webhook`);
   }
 
   async manualSync(ean, sourceStore) {
     const sourceService = sourceStore === 'store1' ? this.store1 : this.store2;
-
+    
     const productData = await sourceService.getProductByEan(ean);
     if (!productData) {
       throw new Error(`Product with EAN ${ean} not found in ${sourceStore}`);
