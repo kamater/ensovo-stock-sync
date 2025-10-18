@@ -9,18 +9,14 @@ const SyncService = require('./services/sync');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* -----------------------------------------------------
-   🔧 CONFIG REDIS
------------------------------------------------------ */
+// Redis client
 const redisClient = createClient({
   url: process.env.REDIS_URL
 });
 
 redisClient.on('error', (err) => console.error('Redis Client Error', err));
 
-/* -----------------------------------------------------
-   🏪 INIT SHOPIFY SERVICES
------------------------------------------------------ */
+// Initialize services
 const shopifyStore1 = new ShopifyService({
   domain: process.env.SHOPIFY_STORE1_DOMAIN,
   accessToken: process.env.SHOPIFY_STORE1_ACCESS_TOKEN,
@@ -37,67 +33,33 @@ const shopifyStore2 = new ShopifyService({
 
 const syncService = new SyncService(shopifyStore1, shopifyStore2, redisClient);
 
-/* -----------------------------------------------------
-   🩺 HEALTH CHECK
------------------------------------------------------ */
+// Middleware for raw body (needed for webhook verification)
+app.use('/webhooks', bodyParser.raw({ type: 'application/json' }));
+app.use(bodyParser.json());
+
+// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-/* -----------------------------------------------------
-   🔒 ROBUST WEBHOOK VERIFICATION (Render-safe)
------------------------------------------------------ */
+// Webhook verification middleware
 function verifyWebhook(shopifyService) {
   return (req, res, next) => {
     const hmac = req.get('X-Shopify-Hmac-Sha256');
-    const topic = req.get('X-Shopify-Topic');
-    const shop = req.get('X-Shopify-Shop-Domain');
-
-    // Ignorer les pings ou webhooks de test sans HMAC
-    if (!hmac) {
-      console.log(`🩵 Ignored ping/test webhook from ${shop || 'unknown'}`);
-      return res.status(200).send('pong');
-    }
-
-    // Forcer le corps en Buffer pour compatibilité Render/Vercel
-    const rawBody = Buffer.isBuffer(req.body)
-      ? req.body
-      : Buffer.from(
-          typeof req.body === 'string'
-            ? req.body
-            : JSON.stringify(req.body),
-          'utf8'
-        );
-
-    // Vérification HMAC
-    if (!shopifyService.verifyWebhook(rawBody, hmac)) {
-      console.error(`🚫 Webhook verification failed (${topic || 'unknown'})`);
+    const body = req.body;
+    
+    if (!shopifyService.verifyWebhook(body, hmac)) {
+      console.error('Webhook verification failed');
       return res.status(401).send('Unauthorized');
     }
-
-    // Parsing JSON après vérification
-    try {
-      req.body = JSON.parse(rawBody.toString('utf8'));
-    } catch (err) {
-      console.error('❌ JSON parse error:', err);
-      return res.status(400).send('Bad Request');
-    }
-
+    
+    req.body = JSON.parse(body.toString());
     next();
   };
 }
 
-/* -----------------------------------------------------
-   ⚙️ MIDDLEWARES
------------------------------------------------------ */
-// Le raw body parser doit s’appliquer avant le JSON parser
-app.use('/webhooks', bodyParser.raw({ type: 'application/json' }));
-app.use(bodyParser.json());
-
-/* -----------------------------------------------------
-   📦 WEBHOOK ENDPOINTS
------------------------------------------------------ */
-app.post('/webhooks/store1/inventory',
+// Webhook endpoints
+app.post('/webhooks/store1/inventory', 
   verifyWebhook(shopifyStore1),
   async (req, res) => {
     res.status(200).send('OK');
@@ -113,9 +75,7 @@ app.post('/webhooks/store2/inventory',
   }
 );
 
-/* -----------------------------------------------------
-   🧭 MANUAL SYNC + DEBUG ENDPOINTS
------------------------------------------------------ */
+// Manual sync endpoint (for testing/debugging)
 app.post('/sync/manual', async (req, res) => {
   try {
     const { ean, sourceStore } = req.body;
@@ -126,17 +86,21 @@ app.post('/sync/manual', async (req, res) => {
   }
 });
 
+// Setup webhooks endpoint
 app.post('/setup/webhooks', async (req, res) => {
   try {
     const baseUrl = req.body.baseUrl || `https://${req.get('host')}`;
+    
     await shopifyStore1.setupWebhook(`${baseUrl}/webhooks/store1/inventory`);
     await shopifyStore2.setupWebhook(`${baseUrl}/webhooks/store2/inventory`);
+    
     res.json({ success: true, message: 'Webhooks configured' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
+// Get sync status
 app.get('/status', async (req, res) => {
   try {
     const stats = await syncService.getStats();
@@ -146,6 +110,7 @@ app.get('/status', async (req, res) => {
   }
 });
 
+// Get sync logs (last 50)
 app.get('/logs', async (req, res) => {
   try {
     const logs = await syncService.getLogs(50);
@@ -155,6 +120,7 @@ app.get('/logs', async (req, res) => {
   }
 });
 
+// Clear cache for a specific product (debug)
 app.post('/cache/clear', async (req, res) => {
   try {
     const { ean, storeName } = req.body;
@@ -165,14 +131,12 @@ app.post('/cache/clear', async (req, res) => {
   }
 });
 
-/* -----------------------------------------------------
-   🚀 START SERVER
------------------------------------------------------ */
+// Start server
 async function start() {
   try {
     await redisClient.connect();
     console.log('✅ Redis connected');
-
+    
     app.listen(PORT, () => {
       console.log(`🚀 Ensovo Stock Sync v2.0 running on port ${PORT}`);
       console.log(`📍 Store 1 (MASTER): ${process.env.SHOPIFY_STORE1_DOMAIN}`);
@@ -186,9 +150,7 @@ async function start() {
   }
 }
 
-/* -----------------------------------------------------
-   🧹 GRACEFUL SHUTDOWN
------------------------------------------------------ */
+// Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
   await redisClient.quit();
