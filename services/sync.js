@@ -23,6 +23,21 @@ class SyncService {
       const ensovoLocation = await sourceService.getLocationByName(this.ensovoLocationName);
 
       if (location_id !== ensovoLocation.id) {
+        // Try to get product info even if wrong location
+        try {
+          const allProducts = await sourceService.getProductsByTag(this.syncTag);
+          for (const p of allProducts) {
+            for (const v of p.variants) {
+              if (v.inventory_item_id === inventory_item_id) {
+                console.log(`⏭️  Skipping - not Ensovo location (got ${location_id}, expected ${ensovoLocation.id})`);
+                console.log(`   📦 Product: "${p.title}" | SKU: ${v.sku || 'N/A'} | EAN: ${v.barcode || 'N/A'}`);
+                return;
+              }
+            }
+          }
+        } catch (e) {
+          // Ignore errors, just skip
+        }
         console.log(`⏭️  Skipping - not Ensovo location (got ${location_id}, expected ${ensovoLocation.id})`);
         return;
       }
@@ -32,7 +47,7 @@ class SyncService {
       const isLocked = await this.redis.get(lockKey);
       
       if (isLocked) {
-        console.log(`🔒 Skipping - sync lock active`);
+        console.log(`🔒 Skipping - sync lock active. Le stock a ete modifie il y a moins de 20 secondes: protection contre les boucles infinies`);
         return;
       }
 
@@ -45,6 +60,12 @@ class SyncService {
       }
 
       const { product, variant } = productData;
+
+      // LOG PRODUCT INFO
+      console.log(`📦 Product: "${product.title}"`);
+      console.log(`   SKU: ${variant.sku || 'N/A'}`);
+      console.log(`   EAN: ${variant.barcode || 'N/A'}`);
+      console.log(`   Variant ID: ${variant.id}`);
 
       if (!variant.barcode) {
         console.log(`⏭️  Variant has no EAN/barcode`);
@@ -145,7 +166,7 @@ class SyncService {
 
       // Set sync lock to prevent infinite loop
       const lockKey = `sync:lock:${targetStore}:${targetVariant.inventory_item_id}`;
-      await this.redis.setEx(lockKey, 30, '1'); // Lock for 30 seconds
+      await this.redis.setEx(lockKey, 20, '1'); // Lock for 20 seconds
 
       // Apply delta to target store
       await targetService.adjustInventoryLevel(
@@ -197,7 +218,7 @@ class SyncService {
 
       // Set sync lock to prevent infinite loop
       const lockKey = `sync:lock:${targetStore}:${targetVariant.inventory_item_id}`;
-      await this.redis.setEx(lockKey, 30, '1');
+      await this.redis.setEx(lockKey, 20, '1'); // Lock for 20 seconds
 
       // Set absolute value in target store
       await targetService.setInventoryLevel(
