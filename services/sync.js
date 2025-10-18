@@ -10,10 +10,13 @@ class SyncService {
   }
 
   async handleInventoryUpdate(sourceStore, webhookData) {
-    try {
-      console.log(`\n📥 Inventory update from ${sourceStore}:`, JSON.stringify(webhookData, null, 2));
+  try {
+    if (!webhookData || typeof webhookData !== 'object') {
+      console.log(`⚠️  Ignored empty or invalid webhook from ${sourceStore}:`, webhookData);
+      return;
+    }
 
-      const { inventory_item_id, location_id, available } = webhookData;
+    const { inventory_item_id, location_id, available } = webhookData;
 
       // Check if this is the Ensovo location
       const sourceService = sourceStore === 'store1' ? this.store1 : this.store2;
