@@ -45,18 +45,37 @@ app.get('/health', (req, res) => {
 });
 
 /* -----------------------------------------------------
-   🔒 WEBHOOK VERIFICATION MIDDLEWARE
+   🔒 ROBUST WEBHOOK VERIFICATION (Render-safe)
 ----------------------------------------------------- */
 function verifyWebhook(shopifyService) {
   return (req, res, next) => {
     const hmac = req.get('X-Shopify-Hmac-Sha256');
-    const rawBody = req.body; // Buffer (raw body)
-    
+    const topic = req.get('X-Shopify-Topic');
+    const shop = req.get('X-Shopify-Shop-Domain');
+
+    // Ignorer les pings ou webhooks de test sans HMAC
+    if (!hmac) {
+      console.log(`🩵 Ignored ping/test webhook from ${shop || 'unknown'}`);
+      return res.status(200).send('pong');
+    }
+
+    // Forcer le corps en Buffer pour compatibilité Render/Vercel
+    const rawBody = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(
+          typeof req.body === 'string'
+            ? req.body
+            : JSON.stringify(req.body),
+          'utf8'
+        );
+
+    // Vérification HMAC
     if (!shopifyService.verifyWebhook(rawBody, hmac)) {
-      console.error('🚫 Webhook verification failed');
+      console.error(`🚫 Webhook verification failed (${topic || 'unknown'})`);
       return res.status(401).send('Unauthorized');
     }
 
+    // Parsing JSON après vérification
     try {
       req.body = JSON.parse(rawBody.toString('utf8'));
     } catch (err) {
@@ -70,9 +89,8 @@ function verifyWebhook(shopifyService) {
 
 /* -----------------------------------------------------
    ⚙️ MIDDLEWARES
-   On applique d’abord le raw body parser uniquement sur /webhooks,
-   puis le parser JSON standard pour le reste.
 ----------------------------------------------------- */
+// Le raw body parser doit s’appliquer avant le JSON parser
 app.use('/webhooks', bodyParser.raw({ type: 'application/json' }));
 app.use(bodyParser.json());
 
