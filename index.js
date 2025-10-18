@@ -45,7 +45,7 @@ app.get('/health', (req, res) => {
 });
 
 /* -----------------------------------------------------
-   🔒 VERIFY WEBHOOK (gzip + raw + debug logs)
+   🔒 VERIFY WEBHOOK
 ----------------------------------------------------- */
 function verifyWebhook(shopifyService) {
   return (req, res, next) => {
@@ -53,32 +53,24 @@ function verifyWebhook(shopifyService) {
     const topic = req.get('X-Shopify-Topic');
     const shop = req.get('X-Shopify-Shop-Domain');
 
-    // Ignore ping/test webhooks
+    // Si pas de HMAC → ping ou test → on ignore sans bruit
     if (!hmac) {
-      console.log(`🩵 Ignored ping/test webhook from ${shop || 'unknown'}`);
       return res.status(200).send('pong');
     }
 
     const rawBody = req.rawBody;
 
-    // Debug info
-    console.log('─────────────────────────────');
-    console.log(`📬 Incoming webhook from ${shop}`);
-    console.log(`🧩 Topic: ${topic}`);
-    console.log(`📦 Raw body length: ${rawBody?.length || 0}`);
-    console.log(`📬 Headers:`, req.headers);
-    console.log('─────────────────────────────');
-
+    // Si la vérification échoue → on renvoie 200 silencieusement pour éviter les retries
     if (!shopifyService.verifyWebhook(rawBody, hmac)) {
-      console.error(`🚫 Webhook verification failed (${topic || 'unknown'})`);
-      return res.status(401).send('Unauthorized');
+      // ⏳ Ne log rien, ne bloque pas — évite les retry Shopify
+      return res.status(200).send('ignored');
     }
 
     try {
       req.body = JSON.parse(rawBody.toString('utf8'));
     } catch (err) {
-      console.error('❌ JSON parse error:', err);
-      return res.status(400).send('Bad Request');
+      // Toujours silencieux
+      return res.status(200).send('ignored');
     }
 
     next();
