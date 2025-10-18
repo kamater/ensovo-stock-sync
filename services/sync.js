@@ -7,16 +7,16 @@ class SyncService {
     this.syncTag = process.env.SYNC_TAG || 'sync-stock';
     this.debounceDelay = parseInt(process.env.DEBOUNCE_DELAY) || 2000;
     this.pendingSyncs = new Map();
+    
+    // Cache duration: 1 hour
+    this.cacheDuration = 3600;
   }
 
   async handleInventoryUpdate(sourceStore, webhookData) {
-  try {
-    if (!webhookData || typeof webhookData !== 'object') {
-      console.log(`⚠️  Ignored empty or invalid webhook from ${sourceStore}:`, webhookData);
-      return;
-    }
+    try {
+      console.log(`\n📥 Inventory update from ${sourceStore}:`, JSON.stringify(webhookData, null, 2));
 
-    const { inventory_item_id, location_id, available } = webhookData;
+      const { inventory_item_id, location_id, available } = webhookData;
 
       // Check if this is the Ensovo location
       const sourceService = sourceStore === 'store1' ? this.store1 : this.store2;
@@ -36,20 +36,15 @@ class SyncService {
         return;
       }
 
-      // Find the product by inventory_item_id and check for sync tag
-      const productData = await this.findProductByInventoryItem(sourceService, inventory_item_id);
+      // Find the product by inventory_item_id using CACHE
+      const productData = await this.findProductByInventoryItemCached(sourceService, sourceStore, inventory_item_id);
       
       if (!productData) {
-        console.log(`⏭️  Product not found for inventory item ${inventory_item_id}`);
+        console.log(`⏭️  Product not found or doesn't have ${this.syncTag} tag`);
         return;
       }
 
       const { product, variant } = productData;
-      
-      if (!product.tags.split(',').map(t => t.trim()).includes(this.syncTag)) {
-        console.log(`⏭️  Product doesn't have ${this.syncTag} tag`);
-        return;
-      }
 
       if (!variant.barcode) {
         console.log(`⏭️  Variant has no EAN/barcode`);
@@ -93,13 +88,33 @@ class SyncService {
     }
   }
 
-  async findProductByInventoryItem(shopifyService, inventoryItemId) {
-    // Get all products with sync tag
-    const products = await shopifyService.getProductsByTag(this.syncTag);
+  async findProductByInventoryItemCached(shopifyService, storeName, inventoryItemId) {
+    // Try to get from cache first
+    const cacheKey = `products:${storeName}:${this.syncTag}`;
+    let cachedProducts = await this.redis.get(cacheKey);
     
+    if (!cachedProducts) {
+      console.log(`🔄 Cache miss - loading products with tag "${this.syncTag}" from ${storeName}...`);
+      
+      // Load products with sync tag
+      const products = await shopifyService.getProductsByTag(this.syncTag);
+      
+      // Store in cache for 1 hour
+      await this.redis.setEx(cacheKey, this.cacheDuration, JSON.stringify(products));
+      cachedProducts = JSON.stringify(products);
+      
+      console.log(`✅ Cached ${products.length} products for ${storeName}`);
+    } else {
+      console.log(`✅ Cache hit - using cached products for ${storeName}`);
+    }
+    
+    const products = JSON.parse(cachedProducts);
+    
+    // Find product with matching inventory_item_id
     for (const product of products) {
       for (const variant of product.variants) {
         if (variant.inventory_item_id === inventoryItemId) {
+          console.log(`✅ Found product: ${product.title} (inventory_item_id: ${inventoryItemId})`);
           return { product, variant };
         }
       }
@@ -280,9 +295,21 @@ class SyncService {
   }
 
   async clearCache(ean, storeName) {
-    const cacheKey = `inventory:${storeName}:${ean}`;
-    await this.redis.del(cacheKey);
+    // Clear inventory cache
+    const inventoryCacheKey = `inventory:${storeName}:${ean}`;
+    await this.redis.del(inventoryCacheKey);
+    
+    // Clear products cache (will force reload)
+    const productsCacheKey = `products:${storeName}:${this.syncTag}`;
+    await this.redis.del(productsCacheKey);
+    
     console.log(`🗑️  Cache cleared for ${ean} in ${storeName}`);
+  }
+
+  async refreshCache(storeName) {
+    const productsCacheKey = `products:${storeName}:${this.syncTag}`;
+    await this.redis.del(productsCacheKey);
+    console.log(`🔄 Products cache cleared for ${storeName} - will reload on next webhook`);
   }
 
   async manualSync(ean, sourceStore) {
