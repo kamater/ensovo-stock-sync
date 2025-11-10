@@ -25,14 +25,18 @@ const shopifyStore1 = new ShopifyService({
   domain: process.env.SHOPIFY_STORE1_DOMAIN,
   accessToken: process.env.SHOPIFY_STORE1_ACCESS_TOKEN,
   webhookSecret: process.env.SHOPIFY_STORE1_WEBHOOK_SECRET,
-  storeName: 'store1'
+  storeName: 'store1',
+  locationId: '107120820601',
+  locationName: 'Naturellement bio'
 });
 
 const shopifyStore2 = new ShopifyService({
   domain: process.env.SHOPIFY_STORE2_DOMAIN,
   accessToken: process.env.SHOPIFY_STORE2_ACCESS_TOKEN,
   webhookSecret: process.env.SHOPIFY_STORE2_WEBHOOK_SECRET,
-  storeName: 'store2'
+  storeName: 'store2',
+  locationId: '110812889462',
+  locationName: 'Ensovo'
 });
 
 const syncService = new SyncService(shopifyStore1, shopifyStore2, redisClient);
@@ -174,10 +178,9 @@ async function start() {
 
     app.listen(PORT, () => {
       console.log(`🚀 Ensovo Stock Sync v2.0 running on port ${PORT}`);
-      console.log(`📍 Store 1 (MASTER): ${process.env.SHOPIFY_STORE1_DOMAIN}`);
-      console.log(`📍 Store 2 (DESTINATION): ${process.env.SHOPIFY_STORE2_DOMAIN}`);
+      console.log(`📍 Store 1: ${process.env.SHOPIFY_STORE1_DOMAIN} - Location: "${shopifyStore1.locationName}" (ID: ${shopifyStore1.locationId})`);
+      console.log(`📍 Store 2: ${process.env.SHOPIFY_STORE2_DOMAIN} - Location: "${shopifyStore2.locationName}" (ID: ${shopifyStore2.locationId})`);
       console.log(`🏷️  Sync tag: ${process.env.SYNC_TAG}`);
-      console.log(`📦 Location: ${process.env.ENSOVO_LOCATION_NAME}`);
     });
   } catch (error) {
     console.error('❌ Failed to start:', error);

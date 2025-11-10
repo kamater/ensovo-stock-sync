@@ -3,11 +3,10 @@ class SyncService {
     this.store1 = shopifyStore1;
     this.store2 = shopifyStore2;
     this.redis = redisClient;
-    this.ensovoLocationName = process.env.ENSOVO_LOCATION_NAME || 'Ensovo';
     this.syncTag = process.env.SYNC_TAG || 'sync-stock';
     this.debounceDelay = parseInt(process.env.DEBOUNCE_DELAY) || 2000;
     this.pendingSyncs = new Map();
-    
+
     // Cache duration: 1 hour
     this.cacheDuration = 3600;
   }
@@ -18,18 +17,18 @@ class SyncService {
 
       const { inventory_item_id, location_id, available } = webhookData;
 
-      // Check if this is the Ensovo location
+      // Check if this is the correct location for this store
       const sourceService = sourceStore === 'store1' ? this.store1 : this.store2;
-      const ensovoLocation = await sourceService.getLocationByName(this.ensovoLocationName);
+      const expectedLocationId = parseInt(sourceService.locationId);
 
-      if (location_id !== ensovoLocation.id) {
+      if (location_id !== expectedLocationId) {
         // Try to get product info even if wrong location
         try {
           const allProducts = await sourceService.getProductsByTag(this.syncTag);
           for (const p of allProducts) {
             for (const v of p.variants) {
               if (v.inventory_item_id === inventory_item_id) {
-                console.log(`⏭️  Skipping - not Ensovo location (got ${location_id}, expected ${ensovoLocation.id})`);
+                console.log(`⏭️  Skipping - not ${sourceService.locationName} location (got ${location_id}, expected ${expectedLocationId})`);
                 console.log(`   📦 Product: "${p.title}" | SKU: ${v.sku || 'N/A'} | EAN: ${v.barcode || 'N/A'}`);
                 return;
               }
@@ -38,7 +37,7 @@ class SyncService {
         } catch (e) {
           // Ignore errors, just skip
         }
-        console.log(`⏭️  Skipping - not Ensovo location (got ${location_id}, expected ${ensovoLocation.id})`);
+        console.log(`⏭️  Skipping - not ${sourceService.locationName} location (got ${location_id}, expected ${expectedLocationId})`);
         return;
       }
 
@@ -161,8 +160,8 @@ class SyncService {
 
       const { variant: targetVariant } = targetProductData;
 
-      // Get Ensovo location in target store
-      const targetEnsovoLocation = await targetService.getLocationByName(this.ensovoLocationName);
+      // Use the configured location ID for target store
+      const targetLocationId = parseInt(targetService.locationId);
 
       // Set sync lock to prevent infinite loop
       const lockKey = `sync:lock:${targetStore}:${targetVariant.inventory_item_id}`;
@@ -171,7 +170,7 @@ class SyncService {
       // Apply delta to target store
       await targetService.adjustInventoryLevel(
         targetVariant.inventory_item_id,
-        targetEnsovoLocation.id,
+        targetLocationId,
         delta
       );
 
@@ -213,8 +212,8 @@ class SyncService {
 
       const { variant: targetVariant } = targetProductData;
 
-      // Get Ensovo location in target store
-      const targetEnsovoLocation = await targetService.getLocationByName(this.ensovoLocationName);
+      // Use the configured location ID for target store
+      const targetLocationId = parseInt(targetService.locationId);
 
       // Set sync lock to prevent infinite loop
       const lockKey = `sync:lock:${targetStore}:${targetVariant.inventory_item_id}`;
@@ -223,7 +222,7 @@ class SyncService {
       // Set absolute value in target store
       await targetService.setInventoryLevel(
         targetVariant.inventory_item_id,
-        targetEnsovoLocation.id,
+        targetLocationId,
         available
       );
 
@@ -335,17 +334,17 @@ class SyncService {
 
   async manualSync(ean, sourceStore) {
     const sourceService = sourceStore === 'store1' ? this.store1 : this.store2;
-    
+
     const productData = await sourceService.getProductByEan(ean);
     if (!productData) {
       throw new Error(`Product with EAN ${ean} not found in ${sourceStore}`);
     }
 
     const { variant } = productData;
-    const location = await sourceService.getLocationByName(this.ensovoLocationName);
+    const locationId = parseInt(sourceService.locationId);
     const inventoryLevel = await sourceService.getInventoryLevel(
       variant.inventory_item_id,
-      location.id
+      locationId
     );
 
     await this.syncFullToOtherStore(sourceStore, ean, inventoryLevel.available);

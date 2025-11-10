@@ -1,11 +1,13 @@
 const crypto = require('crypto');
 
 class ShopifyService {
-  constructor({ domain, accessToken, webhookSecret, storeName }) {
+  constructor({ domain, accessToken, webhookSecret, storeName, locationId, locationName }) {
     this.domain = domain;
     this.accessToken = accessToken;
     this.webhookSecret = webhookSecret;
     this.storeName = storeName;
+    this.locationId = locationId;
+    this.locationName = locationName;
     this.baseUrl = `https://${domain}/admin/api/2024-10`;
   }
 
