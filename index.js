@@ -36,7 +36,7 @@ const shopifyStore2 = new ShopifyService({
   webhookSecret: process.env.SHOPIFY_STORE2_WEBHOOK_SECRET,
   storeName: 'store2',
   locationId: '110812889462',
-  locationName: 'Ensovo'
+  locationName: 'Naturellement bio'
 });
 
 const syncService = new SyncService(shopifyStore1, shopifyStore2, redisClient);
