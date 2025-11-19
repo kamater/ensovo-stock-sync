@@ -112,24 +112,24 @@ class SyncService {
     // Try to get from cache first
     const cacheKey = `products:${storeName}:${this.syncTag}`;
     let cachedProducts = await this.redis.get(cacheKey);
-    
+
     if (!cachedProducts) {
       console.log(`🔄 Cache miss - loading products with tag "${this.syncTag}" from ${storeName}...`);
-      
+
       // Load products with sync tag
       const products = await shopifyService.getProductsByTag(this.syncTag);
-      
+
       // Store in cache for 1 hour
       await this.redis.setEx(cacheKey, this.cacheDuration, JSON.stringify(products));
       cachedProducts = JSON.stringify(products);
-      
+
       console.log(`✅ Cached ${products.length} products for ${storeName}`);
     } else {
       console.log(`✅ Cache hit - using cached products for ${storeName}`);
     }
-    
+
     const products = JSON.parse(cachedProducts);
-    
+
     // Find product with matching inventory_item_id
     for (const product of products) {
       for (const variant of product.variants) {
@@ -139,7 +139,45 @@ class SyncService {
         }
       }
     }
-    
+
+    return null;
+  }
+
+  async getProductByEanCached(shopifyService, storeName, ean) {
+    console.log(`🔍 Searching for product with EAN ${ean} in ${storeName} (cached)...`);
+
+    // Try to get from cache first
+    const cacheKey = `products:${storeName}:${this.syncTag}`;
+    let cachedProducts = await this.redis.get(cacheKey);
+
+    if (!cachedProducts) {
+      console.log(`🔄 Cache miss - loading products with tag "${this.syncTag}" from ${storeName}...`);
+
+      // Load products with sync tag
+      const products = await shopifyService.getProductsByTag(this.syncTag);
+
+      // Store in cache for 1 hour
+      await this.redis.setEx(cacheKey, this.cacheDuration, JSON.stringify(products));
+      cachedProducts = JSON.stringify(products);
+
+      console.log(`✅ Cached ${products.length} products for ${storeName}`);
+    } else {
+      console.log(`✅ Cache hit - using cached products for ${storeName}`);
+    }
+
+    const products = JSON.parse(cachedProducts);
+
+    // Find product with matching EAN
+    for (const product of products) {
+      for (const variant of product.variants) {
+        if (variant.barcode === ean) {
+          console.log(`✅ Found product: ${product.title} (EAN: ${ean})`);
+          return { product, variant };
+        }
+      }
+    }
+
+    console.log(`❌ Product with EAN ${ean} not found in cache for ${storeName}`);
     return null;
   }
 
@@ -150,9 +188,9 @@ class SyncService {
 
       console.log(`🔄 Syncing delta for EAN ${ean} from ${sourceStore} to ${targetStore}: ${delta > 0 ? '+' : ''}${delta} (new value: ${newValue})`);
 
-      // Find product in target store by EAN
-      const targetProductData = await targetService.getProductByEan(ean);
-      
+      // Find product in target store by EAN (using cache)
+      const targetProductData = await this.getProductByEanCached(targetService, targetStore, ean);
+
       if (!targetProductData) {
         console.log(`⚠️  Product with EAN ${ean} not found in ${targetStore}`);
         return;
@@ -202,9 +240,9 @@ class SyncService {
 
       console.log(`🔄 Full sync for EAN ${ean} from ${sourceStore} to ${targetStore}: ${available} units`);
 
-      // Find product in target store by EAN
-      const targetProductData = await targetService.getProductByEan(ean);
-      
+      // Find product in target store by EAN (using cache)
+      const targetProductData = await this.getProductByEanCached(targetService, targetStore, ean);
+
       if (!targetProductData) {
         console.log(`⚠️  Product with EAN ${ean} not found in ${targetStore}`);
         return;
@@ -335,7 +373,7 @@ class SyncService {
   async manualSync(ean, sourceStore) {
     const sourceService = sourceStore === 'store1' ? this.store1 : this.store2;
 
-    const productData = await sourceService.getProductByEan(ean);
+    const productData = await this.getProductByEanCached(sourceService, sourceStore, ean);
     if (!productData) {
       throw new Error(`Product with EAN ${ean} not found in ${sourceStore}`);
     }
