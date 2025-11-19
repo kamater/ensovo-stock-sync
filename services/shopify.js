@@ -9,9 +9,21 @@ class ShopifyService {
     this.locationId = locationId;
     this.locationName = locationName;
     this.baseUrl = `https://${domain}/admin/api/2024-10`;
+
+    // Rate limiter: track last request time to ensure 2 calls/sec max
+    this.lastRequestTime = 0;
+    this.minRequestInterval = 500; // 500ms = 2 calls per second
+    this.requestQueue = [];
+    this.isProcessingQueue = false;
   }
 
-  async makeRequest(endpoint, method = 'GET', body = null) {
+  async makeRequest(endpoint, method = 'GET', body = null, retryCount = 0) {
+    const maxRetries = 5;
+    const baseDelay = 1000; // 1 second
+
+    // Rate limiting: ensure we don't exceed 2 calls/sec
+    await this.rateLimitDelay();
+
     const url = `${this.baseUrl}${endpoint}`;
     const options = {
       method,
@@ -25,18 +37,60 @@ class ShopifyService {
       options.body = JSON.stringify(body);
     }
 
-    const response = await fetch(url, options);
-    
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Shopify API error (${this.storeName}): ${error}`);
+    try {
+      const response = await fetch(url, options);
+
+      if (!response.ok) {
+        const error = await response.text();
+
+        // Check if it's a rate limit error (429 or specific message)
+        const isRateLimitError = response.status === 429 ||
+                                 error.includes('Exceeded 2 calls per second') ||
+                                 error.includes('throttled');
+
+        if (isRateLimitError && retryCount < maxRetries) {
+          // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+          const delay = baseDelay * Math.pow(2, retryCount);
+          console.log(`⏳ Rate limit hit for ${this.storeName}, retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})...`);
+
+          await this.sleep(delay);
+          return this.makeRequest(endpoint, method, body, retryCount + 1);
+        }
+
+        throw new Error(`Shopify API error (${this.storeName}): ${error}`);
+      }
+
+      // Get Link header for pagination
+      const linkHeader = response.headers.get('Link');
+      const data = await response.json();
+
+      return { data, linkHeader };
+    } catch (error) {
+      // Network errors or other fetch errors
+      if (retryCount < maxRetries && error.message.includes('fetch')) {
+        const delay = baseDelay * Math.pow(2, retryCount);
+        console.log(`⚠️  Network error for ${this.storeName}, retrying in ${delay}ms...`);
+        await this.sleep(delay);
+        return this.makeRequest(endpoint, method, body, retryCount + 1);
+      }
+      throw error;
+    }
+  }
+
+  async rateLimitDelay() {
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastRequestTime;
+
+    if (timeSinceLastRequest < this.minRequestInterval) {
+      const delay = this.minRequestInterval - timeSinceLastRequest;
+      await this.sleep(delay);
     }
 
-    // Get Link header for pagination
-    const linkHeader = response.headers.get('Link');
-    const data = await response.json();
-    
-    return { data, linkHeader };
+    this.lastRequestTime = Date.now();
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   verifyWebhook(body, hmac) {
