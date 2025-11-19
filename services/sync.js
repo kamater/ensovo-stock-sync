@@ -7,8 +7,8 @@ class SyncService {
     this.debounceDelay = parseInt(process.env.DEBOUNCE_DELAY) || 2000;
     this.pendingSyncs = new Map();
 
-    // Cache duration: 1 hour
-    this.cacheDuration = 3600;
+    // Cache duration: 15 minutes (reduced from 1 hour to better handle tag updates)
+    this.cacheDuration = parseInt(process.env.CACHE_DURATION) || 900;
   }
 
   async handleInventoryUpdate(sourceStore, webhookData) {
@@ -51,11 +51,19 @@ class SyncService {
       }
 
       // Find the product by inventory_item_id using CACHE
-      const productData = await this.findProductByInventoryItemCached(sourceService, sourceStore, inventory_item_id);
-      
+      let productData = await this.findProductByInventoryItemCached(sourceService, sourceStore, inventory_item_id);
+
       if (!productData) {
-        console.log(`⏭️  Product not found or doesn't have ${this.syncTag} tag`);
-        return;
+        // Product not found in cache - it might have been recently tagged
+        // Clear cache and try one more time with fresh data
+        console.log(`⚠️  Product not found in cache - refreshing and retrying...`);
+        await this.refreshCache(sourceStore);
+        productData = await this.findProductByInventoryItemCached(sourceService, sourceStore, inventory_item_id);
+
+        if (!productData) {
+          console.log(`⏭️  Product not found or doesn't have ${this.syncTag} tag`);
+          return;
+        }
       }
 
       const { product, variant } = productData;
@@ -353,15 +361,17 @@ class SyncService {
   }
 
   async clearCache(ean, storeName) {
-    // Clear inventory cache
-    const inventoryCacheKey = `inventory:${storeName}:${ean}`;
-    await this.redis.del(inventoryCacheKey);
-    
+    if (ean) {
+      // Clear inventory cache for specific product
+      const inventoryCacheKey = `inventory:${storeName}:${ean}`;
+      await this.redis.del(inventoryCacheKey);
+      console.log(`🗑️  Inventory cache cleared for EAN ${ean} in ${storeName}`);
+    }
+
     // Clear products cache (will force reload)
     const productsCacheKey = `products:${storeName}:${this.syncTag}`;
     await this.redis.del(productsCacheKey);
-    
-    console.log(`🗑️  Cache cleared for ${ean} in ${storeName}`);
+    console.log(`🗑️  Products cache cleared for ${storeName}`);
   }
 
   async refreshCache(storeName) {
