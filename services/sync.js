@@ -7,11 +7,9 @@ class SyncService {
     this.debounceDelay = parseInt(process.env.DEBOUNCE_DELAY) || 2000;
     this.pendingSyncs = new Map();
 
-    // Cache duration: 15 minutes (reduced from 1 hour to better handle tag updates)
-    this.cacheDuration = parseInt(process.env.CACHE_DURATION) || 900;
-
-    // Cache refresh cooldown: prevent reloading cache too often (5 minutes)
-    this.cacheRefreshCooldown = parseInt(process.env.CACHE_REFRESH_COOLDOWN) || 300;
+    // Cache duration: 30 minutes (configurable via CACHE_DURATION)
+    // Cache expires naturally - no auto-refresh to save resources
+    this.cacheDuration = parseInt(process.env.CACHE_DURATION) || 1800;
   }
 
   async handleInventoryUpdate(sourceStore, webhookData) {
@@ -54,37 +52,11 @@ class SyncService {
       }
 
       // Find the product by inventory_item_id using CACHE
-      let productData = await this.findProductByInventoryItemCached(sourceService, sourceStore, inventory_item_id);
+      const productData = await this.findProductByInventoryItemCached(sourceService, sourceStore, inventory_item_id);
 
       if (!productData) {
-        // Check negative cache first (products we know don't have the tag)
-        const negativeCacheKey = `negative:${sourceStore}:${inventory_item_id}`;
-        const isInNegativeCache = await this.redis.get(negativeCacheKey);
-
-        if (isInNegativeCache) {
-          // Product is known to not have the tag, skip silently
-          return;
-        }
-
-        // Check if we can refresh the cache (cooldown check)
-        const lastRefreshKey = `cache:last-refresh:${sourceStore}`;
-        const lastRefresh = await this.redis.get(lastRefreshKey);
-        const now = Math.floor(Date.now() / 1000);
-
-        if (!lastRefresh || (now - parseInt(lastRefresh)) > this.cacheRefreshCooldown) {
-          // Cooldown expired, we can try refreshing
-          console.log(`⚠️  Product not found in cache - refreshing (cooldown: ${this.cacheRefreshCooldown}s)...`);
-          await this.redis.setEx(lastRefreshKey, this.cacheRefreshCooldown, now.toString());
-          await this.refreshCache(sourceStore);
-          productData = await this.findProductByInventoryItemCached(sourceService, sourceStore, inventory_item_id);
-        }
-
-        if (!productData) {
-          // Still not found - add to negative cache (expires after 1 hour)
-          await this.redis.setEx(negativeCacheKey, 3600, '1');
-          console.log(`⏭️  Product not found or doesn't have ${this.syncTag} tag`);
-          return;
-        }
+        console.log(`⏭️  Product not found or doesn't have ${this.syncTag} tag`);
+        return;
       }
 
       const { product, variant } = productData;
@@ -389,20 +361,9 @@ class SyncService {
       console.log(`🗑️  Inventory cache cleared for EAN ${ean} in ${storeName}`);
     }
 
-    // Clear products cache (will force reload)
+    // Clear products cache (will force reload on next webhook)
     const productsCacheKey = `products:${storeName}:${this.syncTag}`;
     await this.redis.del(productsCacheKey);
-
-    // Clear negative cache for this store
-    const negativeKeys = await this.redis.keys(`negative:${storeName}:*`);
-    if (negativeKeys.length > 0) {
-      await this.redis.del(negativeKeys);
-      console.log(`🗑️  Cleared ${negativeKeys.length} negative cache entries for ${storeName}`);
-    }
-
-    // Clear refresh cooldown to allow immediate reload
-    const lastRefreshKey = `cache:last-refresh:${storeName}`;
-    await this.redis.del(lastRefreshKey);
 
     console.log(`🗑️  Products cache cleared for ${storeName}`);
   }
