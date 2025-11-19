@@ -161,8 +161,18 @@ app.get('/logs', async (req, res) => {
 app.post('/cache/clear', async (req, res) => {
   try {
     const { ean, storeName } = req.body;
+
+    if (!storeName) {
+      return res.status(400).json({ error: 'storeName is required' });
+    }
+
     await syncService.clearCache(ean, storeName);
-    res.json({ success: true, message: 'Cache cleared' });
+
+    const message = ean
+      ? `Cache cleared for EAN ${ean} in ${storeName}`
+      : `Products cache cleared for ${storeName}`;
+
+    res.json({ success: true, message });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
