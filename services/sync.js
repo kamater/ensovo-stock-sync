@@ -1,3 +1,5 @@
+const PQueue = require('p-queue').default;
+
 class SyncService {
   constructor(shopifyStore1, shopifyStore2, redisClient) {
     this.store1 = shopifyStore1;
@@ -10,9 +12,19 @@ class SyncService {
     // Cache duration: 30 minutes (configurable via CACHE_DURATION)
     // Cache expires naturally - no auto-refresh to save resources
     this.cacheDuration = parseInt(process.env.CACHE_DURATION) || 1800;
+
+    // Processing queue: limit concurrent webhook processing (default: 5)
+    // Prevents memory/CPU overload on resource-constrained environments (e.g., Render free tier)
+    const concurrency = parseInt(process.env.QUEUE_CONCURRENCY) || 5;
+    this.queue = new PQueue({ concurrency });
   }
 
   async handleInventoryUpdate(sourceStore, webhookData) {
+    // Add to queue to prevent overload - queue will process with limited concurrency
+    await this.queue.add(() => this.processInventoryUpdate(sourceStore, webhookData));
+  }
+
+  async processInventoryUpdate(sourceStore, webhookData) {
     try {
       console.log(`\n📥 Inventory update from ${sourceStore}:`, JSON.stringify(webhookData, null, 2));
 
@@ -45,7 +57,7 @@ class SyncService {
       // Check if this is a sync we triggered (avoid infinite loop)
       const lockKey = `sync:lock:${sourceStore}:${inventory_item_id}`;
       const isLocked = await this.redis.get(lockKey);
-      
+
       if (isLocked) {
         console.log(`🔒 Skipping - sync lock active. Le stock a ete modifie il y a moins de 20 secondes: protection contre les boucles infinies`);
         return;
